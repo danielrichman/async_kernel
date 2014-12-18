@@ -226,7 +226,7 @@ type ('a, 'phantom) t =
      That function walks to the head(s) of the upstream pipe, and calls
      [downstream_flushed] on the head(s).  See the definition of [upstream_flushed]
      below. *)
-  ; mutable upstream_flusheds : (unit -> Flushed_result.t Deferred.t) list
+  ; upstream_flusheds         : (unit -> Flushed_result.t Deferred.t) Bag.t
   }
 with fields, sexp_of
 
@@ -312,7 +312,7 @@ let create () =
     ; blocked_flushes   = Q.create    ()
     ; blocked_reads     = Q.create    ()
     ; consumers         = []
-    ; upstream_flusheds = []
+    ; upstream_flusheds = Bag.create  ()
     }
   in
   Ivar.fill t.pushback (); (* initially, the pipe does not pushback *)
@@ -611,13 +611,17 @@ let downstream_flushed t =
    the graph of linked pipes up to the heads and then calls [downstream_flushed] on
    them. *)
 let upstream_flushed t =
-  if List.is_empty t.upstream_flusheds
+  if Bag.is_empty t.upstream_flusheds
   then downstream_flushed t
-  else Flushed_result.combine (List.map t.upstream_flusheds ~f:(fun f -> f ()))
+  else
+    Bag.to_list t.upstream_flusheds
+    |> List.map ~f:(fun f -> f ())
+    |> Flushed_result.combine
 ;;
 
 let add_upstream_flushed t upstream_flushed =
-  t.upstream_flusheds <- upstream_flushed :: t.upstream_flusheds;
+  let elt = Bag.add t.upstream_flusheds upstream_flushed in
+  (fun () -> Bag.remove t.upstream_flusheds elt)
 ;;
 
 let add_consumer t ~downstream_flushed =
@@ -626,10 +630,13 @@ let add_consumer t ~downstream_flushed =
   consumer;
 ;;
 
-(* [link ~upstream ~downstream] links flushing of two pipes together. *)
+(* [link ~upstream ~downstream] links flushing of two pipes together.
+   It returns a [Consumer] for the upstream->downstream link, and a function that
+   if called will delete the downstream->upstream link. *)
 let link ~upstream ~downstream =
-  add_upstream_flushed downstream (fun () -> upstream_flushed upstream);
-  add_consumer upstream ~downstream_flushed:(fun () -> downstream_flushed downstream);
+  ( add_consumer upstream ~downstream_flushed:(fun () -> downstream_flushed downstream)
+  , add_upstream_flushed downstream (fun () -> upstream_flushed upstream)
+  )
 ;;
 
 type ('a, 'b, 'c, 'accum) fold =
@@ -786,40 +793,44 @@ let transfer_gen
     invariant input;
     invariant output;
   end;
-  let consumer = link ~upstream:input ~downstream:output in
-  Deferred.create (fun result ->
-    (* We do [Deferred.unit >>>] to ensure that [f] is only called asynchronously. *)
-    Deferred.unit
-    >>> fun () ->
-    let output_closed () =
-      close_read input;
-      Ivar.fill result ()
-    in
-    let rec loop () =
-      if is_closed output
-      then output_closed ()
-      else
-        match read_now input ~consumer with
-        | `Eof -> Ivar.fill result ()
-        | `Ok x -> f x continue
-        | `Nothing_available ->
-          choose [ choice (values_available input) ignore
-                 ; choice (closed output)          ignore
-                 ]
-          >>> fun () ->
-          loop ()
-    and continue y =
-      if is_closed output
-      then output_closed ()
-      else begin
-        let pushback = write output y in
-        Consumer.values_sent_downstream consumer;
-        pushback
+  let (consumer, remove_down_to_up_link) = link ~upstream:input ~downstream:output in
+  Monitor.protect
+    ~finally:(fun () -> remove_down_to_up_link (); Deferred.unit)
+    (fun () ->
+      Deferred.create (fun result ->
+        (* We do [Deferred.unit >>>] to ensure that [f] is only called asynchronously. *)
+        Deferred.unit
         >>> fun () ->
-        loop ()
-      end
-    in
-    loop ())
+        let output_closed () =
+          close_read input;
+          Ivar.fill result ()
+        in
+        let rec loop () =
+          if is_closed output
+          then output_closed ()
+          else
+            match read_now input ~consumer with
+            | `Eof -> Ivar.fill result ()
+            | `Ok x -> f x continue
+            | `Nothing_available ->
+              choose [ choice (values_available input) ignore
+                     ; choice (closed output)          ignore
+                     ]
+              >>> fun () ->
+              loop ()
+        and continue y =
+          if is_closed output
+          then output_closed ()
+          else begin
+            let pushback = write output y in
+            Consumer.values_sent_downstream consumer;
+            pushback
+            >>> fun () ->
+            loop ()
+          end
+        in
+        loop ())
+    )
 ;;
 
 let transfer' input output ~f =
